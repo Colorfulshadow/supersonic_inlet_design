@@ -17,6 +17,9 @@ inlets/pitot/aero_design.py
 
 from __future__ import annotations
 
+from typing import Optional
+
+from core.atmosphere import ISAAtmosphere
 from core.compressible_flow import (
     M2_after_normal_shock,
     shock_pt_ratio,
@@ -26,7 +29,12 @@ from core.compressible_flow import (
 from core.flow_stations import FlowState, InletFlowStations
 
 
-def design_pitot(M0: float, gamma: float = 1.4) -> InletFlowStations:
+def design_pitot(
+    M0: float,
+    gamma: float = 1.4,
+    h_km: Optional[float] = None,
+    m_dot: Optional[float] = None,
+) -> InletFlowStations:
     """皮托管进气道气动设计。
 
     来流经单道正激波减速，激波后直接进入亚声速扩压段。
@@ -37,6 +45,12 @@ def design_pitot(M0: float, gamma: float = 1.4) -> InletFlowStations:
         来流马赫数（站位 0），必须 > 1.0。
     gamma : float
         比热比，默认 1.4。
+    h_km : float, optional
+        飞行高度，单位：千米（km）。若同时提供 ``m_dot``，则调用
+        :meth:`~core.flow_stations.InletFlowStations.attach_physical_conditions`
+        将归一化量转换为真实绝对物理量。
+    m_dot : float, optional
+        质量流量，单位：kg/s。仅在同时提供 ``h_km`` 时生效。
 
     Returns
     -------
@@ -99,7 +113,7 @@ def design_pitot(M0: float, gamma: float = 1.4) -> InletFlowStations:
     st2 = FlowState(M=M_NS, p_t=pt_NS, T_t=T_t_NS, label="2")
 
     # ------------------------------------------------------------------
-    # 组装并返回
+    # 组装
     # ------------------------------------------------------------------
     stations = InletFlowStations(
         st0=st0,
@@ -108,4 +122,12 @@ def design_pitot(M0: float, gamma: float = 1.4) -> InletFlowStations:
         st1=st1,
         st2=st2,
     )
+
+    # ------------------------------------------------------------------
+    # 可选：附加真实物理量
+    # ------------------------------------------------------------------
+    if h_km is not None and m_dot is not None:
+        atm = ISAAtmosphere(h_km * 1000.0, gamma)
+        stations.attach_physical_conditions(atm, M0, m_dot)
+
     return stations

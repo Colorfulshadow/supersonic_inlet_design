@@ -32,6 +32,7 @@ from typing import List, Optional
 import numpy as np
 from scipy.optimize import brentq
 
+from core.atmosphere import ISAAtmosphere
 from core.compressible_flow import (
     M2_after_normal_shock,
     M2_after_oblique_shock,
@@ -184,6 +185,8 @@ def design_external_2d(
     N_stages: int = 3,
     M_EX: Optional[float] = None,
     gamma: float = 1.4,
+    h_km: Optional[float] = None,
+    m_dot: Optional[float] = None,
 ) -> InletFlowStations:
     """二元外压式进气道气动设计（Oswatitsch 最优准则）。
 
@@ -201,6 +204,10 @@ def design_external_2d(
           全部相等，通过固定点条件 ``simulate(M_n) = M_n`` 自动求解最优 M_EX。
     gamma : float
         比热比，默认 1.4。
+    h_km : float, optional
+        飞行高度，单位：千米（km）。若同时提供 ``m_dot``，则附加真实物理量。
+    m_dot : float, optional
+        质量流量，单位：kg/s。仅在同时提供 ``h_km`` 时生效。
 
     Returns
     -------
@@ -275,6 +282,14 @@ def design_external_2d(
 
     stations = InletFlowStations(st0=st0, stEX=stEX, stNS=stNS, st1=st1, st2=st2)
     stations.wedge_angles = thetas  # 动态属性，方便外部访问
+
+    # ------------------------------------------------------------------
+    # 可选：附加真实物理量
+    # ------------------------------------------------------------------
+    if h_km is not None and m_dot is not None:
+        atm = ISAAtmosphere(h_km * 1000.0, gamma)
+        stations.attach_physical_conditions(atm, M0, m_dot)
+
     return stations
 
 

@@ -21,7 +21,9 @@ inlets/axisymmetric/aero_design.py
 from __future__ import annotations
 
 import math
+from typing import Optional
 
+from core.atmosphere import ISAAtmosphere
 from core.compressible_flow import (
     M2_after_normal_shock,
     shock_pt_ratio,
@@ -35,6 +37,8 @@ def design_axisymmetric(
     delta_c_deg: float | None = None,
     M_EX: float = 1.30,
     gamma: float = 1.4,
+    h_km: Optional[float] = None,
+    m_dot: Optional[float] = None,
 ) -> InletFlowStations:
     """轴对称锥形激波进气道气动设计。
 
@@ -48,6 +52,10 @@ def design_axisymmetric(
         终端正激波前马赫数（站位 EX），默认 1.30。
     gamma : float
         比热比，默认 1.4。
+    h_km : float, optional
+        飞行高度，单位：千米（km）。若同时提供 ``m_dot``，则附加真实物理量。
+    m_dot : float, optional
+        质量流量，单位：kg/s。仅在同时提供 ``h_km`` 时生效。
 
     Returns
     -------
@@ -171,6 +179,13 @@ def design_axisymmetric(
         "sigma_cone": sigma_cone,
         "sigma_isentropic": 1.0,
     }
+
+    # ------------------------------------------------------------------
+    # 可选：附加真实物理量
+    # ------------------------------------------------------------------
+    if h_km is not None and m_dot is not None:
+        atm = ISAAtmosphere(h_km * 1000.0, gamma)
+        stations.attach_physical_conditions(atm, M0, m_dot)
 
     return stations
 

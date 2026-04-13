@@ -8,6 +8,7 @@ pytest 测试：core/flow_stations.py
 """
 
 import pytest
+from core.atmosphere import ISAAtmosphere
 from core.flow_stations import FlowState, InletFlowStations
 
 
@@ -285,3 +286,159 @@ class TestSummary:
         s = ifs.summary()
         for tag in ["0", "L", "EX", "NS", "1", "TH", "SD", "2"]:
             assert tag in s, f"摘要中缺少站位标签 '{tag}'"
+
+
+# ---------------------------------------------------------------------------
+# attach_physical_conditions
+# ---------------------------------------------------------------------------
+
+def _make_pitot_normalized() -> InletFlowStations:
+    """构造皮托管式归一化站位（p_t0=1.0, T_t0=1.0, sigma=0.7209）。"""
+    sigma = 0.7209
+    st0  = FlowState(M=2.0,    p_t=1.0,   T_t=1.0, label="0")
+    stEX = FlowState(M=2.0,    p_t=1.0,   T_t=1.0, label="EX")
+    stNS = FlowState(M=0.5774, p_t=sigma, T_t=1.0, label="NS")
+    st1  = FlowState(M=0.5774, p_t=sigma, T_t=1.0, label="1")
+    st2  = FlowState(M=0.5774, p_t=sigma, T_t=1.0, label="2")
+    return InletFlowStations(st0=st0, stEX=stEX, stNS=stNS, st1=st1, st2=st2)
+
+
+class TestAttachPhysicalConditions:
+    """验证 InletFlowStations.attach_physical_conditions 的行为。"""
+
+    H_KM = 20.0          # 设计飞行高度（km）
+    H_M  = 20000.0       # 米
+    M0   = 2.0
+    MDOT = 100.0         # kg/s
+
+    def _atm(self):
+        return ISAAtmosphere(self.H_M)
+
+    # ---- 正常工况 ----
+
+    def test_st0_total_pressure_scaled(self):
+        """st0.p_t 应等于真实来流总压（等熵关系）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+        P0_expected = atm.total_pressure(self.M0)
+        assert abs(ifs.st0.p_t - P0_expected) < 1.0, (
+            f"st0.p_t = {ifs.st0.p_t:.2f} Pa，期望 {P0_expected:.2f} Pa"
+        )
+
+    def test_st0_total_temperature_scaled(self):
+        """st0.T_t 应等于真实来流总温（等熵关系）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+        T0_expected = atm.total_temperature(self.M0)
+        assert abs(ifs.st0.T_t - T0_expected) < 0.1, (
+            f"st0.T_t = {ifs.st0.T_t:.2f} K，期望 {T0_expected:.2f} K"
+        )
+
+    def test_st0_static_conditions_attached(self):
+        """st0 应附加真实静温（T）、静压（p）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+        assert abs(ifs.st0.T - 216.65) < 0.01, f"st0.T = {ifs.st0.T}"
+        assert abs(ifs.st0.p - 5474.9) < 2.0,  f"st0.p = {ifs.st0.p}"
+
+    def test_st0_rho_and_v_attached(self):
+        """st0 应附加密度 rho 和速度 v（动态属性）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+        assert hasattr(ifs.st0, "rho"), "st0 缺少 rho 属性"
+        assert hasattr(ifs.st0, "v"),   "st0 缺少 v 属性"
+        assert abs(ifs.st0.rho - 0.08803) < 0.00005
+        assert abs(ifs.st0.v - 590.14)   < 0.5
+
+    def test_capture_area_attached(self):
+        """self.A_cap 应 ≈ 1.924 m²（±0.005 m²）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+        assert hasattr(ifs, "A_cap"), "InletFlowStations 缺少 A_cap 属性"
+        assert abs(ifs.A_cap - 1.924) < 0.005, (
+            f"A_cap = {ifs.A_cap:.4f} m²，期望 1.924 m²"
+        )
+
+    def test_sigma_preserved_after_scaling(self):
+        """缩放不改变总压恢复系数 σ = p_t2 / p_t0。"""
+        ifs = _make_pitot_normalized()
+        sigma_before = ifs.total_pressure_recovery()   # 归一化下的 σ
+
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+        sigma_after = ifs.total_pressure_recovery()    # 绝对量下的 σ
+
+        assert abs(sigma_after - sigma_before) < 1e-9, (
+            f"缩放前 σ={sigma_before:.8f}，缩放后 σ={sigma_after:.8f}，应相同"
+        )
+
+    def test_all_stations_pt_scaled(self):
+        """所有非 None 站位的 p_t 均应按比例放大。"""
+        ifs = _make_pitot_normalized()
+        pt_before = {
+            attr: getattr(ifs, attr).p_t
+            for attr in ["st0", "stEX", "stNS", "st1", "st2"]
+        }
+        atm = self._atm()
+        P0_abs = atm.total_pressure(self.M0)
+        scale = P0_abs / 1.0   # p_t0_rel = 1.0
+
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+        for attr, pt_orig in pt_before.items():
+            pt_new = getattr(ifs, attr).p_t
+            assert abs(pt_new - pt_orig * scale) < 1.0, (
+                f"{attr}.p_t 缩放异常：{pt_orig:.6f} × {scale:.2f} ≠ {pt_new:.2f}"
+            )
+
+    # ---- 错误处理 ----
+
+    def test_mdot_zero_raises(self):
+        """m_dot=0（σ=0 语义）时应抛出 ValueError。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        with pytest.raises(ValueError, match="m_dot"):
+            ifs.attach_physical_conditions(atm, self.M0, 0.0)
+
+    def test_mdot_negative_raises(self):
+        """m_dot < 0 时应抛出 ValueError。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        with pytest.raises(ValueError):
+            ifs.attach_physical_conditions(atm, self.M0, -50.0)
+
+    def test_st0_none_raises(self):
+        """st0 为 None 时应抛出 ValueError。"""
+        ifs = InletFlowStations()
+        atm = self._atm()
+        with pytest.raises(ValueError, match="st0"):
+            ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+
+    # ---- 物理量纲验证 ----
+
+    def test_A_cap_units_m2(self):
+        """A_cap 量纲应为 m²，数值在合理范围内（0.1~10 m²）。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+        assert 0.1 < ifs.A_cap < 10.0, f"A_cap = {ifs.A_cap:.4f} m² 不在合理范围"
+
+    def test_A_cap_slater2023_tolerance(self):
+        """与 Slater 2023 基准偏差 < 2%。"""
+        ifs = _make_pitot_normalized()
+        atm = self._atm()
+        ifs.attach_physical_conditions(atm, self.M0, self.MDOT)
+        slater_ref = 1.924
+        rel_err = abs(ifs.A_cap - slater_ref) / slater_ref
+        assert rel_err < 0.02, (
+            f"A_cap = {ifs.A_cap:.4f} m²，相对误差 {rel_err*100:.2f}% > 2%"
+        )

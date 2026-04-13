@@ -3,6 +3,12 @@ core/flow_stations.py
 =====================
 8 站位流场框架数据类，对应 CLAUDE.md §六。
 
+新增方法
+--------
+- ``attach_physical_conditions(atm, M0, m_dot)``
+  为各站位附加真实物理绝对量（将归一化总压按大气条件缩放，并为 st0 附加
+  真实静温、静压、密度、速度等字段）。
+
 站位定义
 --------
 0   自由来流，M₀
@@ -23,8 +29,12 @@ SD  亚声速扩压起点
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    # 仅用于类型注解，避免运行时循环导入
+    from core.atmosphere import ISAAtmosphere
 
 
 @dataclass
@@ -176,3 +186,96 @@ class InletFlowStations:
             lines.append("-" * 52)
             lines.append(f"  总压恢复系数 σ = {sigma:.6f}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 物理定尺：将归一化量转换为真实绝对量
+    # ------------------------------------------------------------------
+
+    def attach_physical_conditions(
+        self,
+        atm: "ISAAtmosphere",
+        M0: float,
+        m_dot: float,
+    ) -> None:
+        """为各站位附加真实物理绝对量。
+
+        将当前各站位的归一化总压（以 st0.p_t 为基准的相对比值）缩放为
+        基于 ISA 标准大气的绝对总压值，并为 st0 附加真实静温、静压、
+        密度、速度等附加字段。
+
+        Parameters
+        ----------
+        atm : ISAAtmosphere
+            已初始化的大气对象（包含飞行高度处的静态参数）。
+        M0 : float
+            来流马赫数（与气动设计时一致）。
+        m_dot : float
+            质量流量（kg/s），用于计算真实捕获面积；必须 > 0。
+
+        Raises
+        ------
+        ValueError
+            - 若 ``m_dot ≤ 0``（零质量流量无物理意义）。
+            - 若 ``st0`` 为 ``None``（基准站位缺失，无法缩放）。
+            - 若 ``st0.p_t ≤ 0``（归一化基准为零，无法建立缩放关系）。
+
+        Notes
+        -----
+        **缩放逻辑**：调用前各站位 ``p_t`` 通常以 ``st0.p_t = 1.0`` 归一化，
+        ``p_t[i] / p_t[0]`` 表示该站位相对 st0 的总压比（= 链式总压恢复比）。
+        本方法计算真实 ``p_t0_abs = p_static * (1+(γ-1)/2*M²)^(γ/(γ-1))``，
+        然后对所有非 None 站位执行 ``p_t_abs = p_t_rel / p_t0_rel * p_t0_abs``。
+        总温同理（``T_t = T_static * (1+(γ-1)/2*M²)``，各站等量缩放）。
+
+        **附加属性**（动态挂载，不修改 dataclass 定义）：
+
+        - ``st0.T``   → 真实静温（K）（覆盖原 Optional[float]）
+        - ``st0.p``   → 真实静压（Pa）（覆盖原 Optional[float]）
+        - ``st0.rho`` → 密度（kg/m³）
+        - ``st0.v``   → 来流速度（m/s）
+        - ``self.A_cap`` → 捕获面积（m²）
+        """
+        # ---- 参数校验 ----
+        if m_dot <= 0.0:
+            raise ValueError(
+                f"质量流量 m_dot 必须 > 0，当前 m_dot={m_dot}。"
+                "零或负质量流量在物理上无意义。"
+            )
+        if self.st0 is None:
+            raise ValueError(
+                "attach_physical_conditions 要求 st0 已赋值，"
+                "请先完成气动设计再调用此方法。"
+            )
+        p_t0_rel: float = self.st0.p_t
+        if p_t0_rel <= 0.0:
+            raise ValueError(
+                f"st0.p_t 必须 > 0，当前 {p_t0_rel}。归一化基准无效。"
+            )
+
+        # ---- 来流真实总条件（等熵）----
+        gamma = atm.gamma
+        T_t0_abs: float = atm.total_temperature(M0)   # K
+        p_t0_abs: float = atm.total_pressure(M0)      # Pa
+
+        # ---- 缩放因子 ----
+        p_scale = p_t0_abs / p_t0_rel
+        T_scale = T_t0_abs / self.st0.T_t   # 通常 st0.T_t=1.0，T_scale=T_t0_abs
+
+        # ---- 更新所有非 None 站位的绝对总温总压 ----
+        _all_stations = [
+            "st0", "stL", "stEX", "stNS", "st1", "stTH", "stSD", "st2",
+        ]
+        for attr in _all_stations:
+            st: Optional[FlowState] = getattr(self, attr)
+            if st is not None:
+                st.p_t = st.p_t * p_scale
+                st.T_t = st.T_t * T_scale
+
+        # ---- 为 st0 附加真实静条件及速度 ----
+        self.st0.T = atm.T_static                     # 静温（K）
+        self.st0.p = atm.p_static                     # 静压（Pa）
+        self.st0.rho = atm.rho                        # type: ignore[attr-defined]
+        self.st0.v   = atm.velocity(M0)               # type: ignore[attr-defined]
+
+        # ---- 捕获面积 ----
+        self.A_cap = atm.capture_area(m_dot, M0)      # type: ignore[attr-defined]
