@@ -19,7 +19,16 @@ inlets/axisymmetric/geometry.py
   cowl 内壁从 (0, r_cowl) 线性扩张至 (x_diffuser_end, r_exit)。
   等效扩张半角 3°：L_diffuser = (r_exit - r_cowl) / tan(3°)。
 
-r_cowl 以 D2_ref=1.0 m 为参考尺度计算（约 0.624 m），与输入 D2 解耦。
+物理定尺（CLAUDE.md §三 原则 8）：
+  r_capture 由 ISA 标准大气 + 质量流量正向推算（core/atmosphere.capture_area）。
+  设计工况（ṁ=100 kg/s，M₀=2.0，H=20 km）：A_cap≈1.924 m²，r_capture≈0.782 m。
+  禁止使用无量纲参考尺度（如 D2_ref）作为主驱动量。
+
+shock-on-lip 几何：
+  锥形激波从锥尖出发恰好打在 cowl 唇口：
+    L_cone = r_capture / tan(β_c)    （锥尖到唇口的轴向距离）
+    r_cb_base = L_cone × tan(δ_c)   （唇口截面中心锥底部半径）
+
 要求 D2/2 >= r_cowl（cowl 向外扩张），否则抛出 ValueError。
 """
 
@@ -27,7 +36,9 @@ from __future__ import annotations
 
 import math
 
-from core.compressible_flow import mass_flow_function
+import numpy as np
+
+from core.atmosphere import capture_area as _isa_capture_area
 from core.flow_stations import InletFlowStations
 
 
@@ -35,6 +46,10 @@ def axisymmetric_geometry(
     stations: InletFlowStations,
     D2: float,
     gamma: float = 1.4,
+    lip_mode: int = 1,
+    r_lip: float = 0.0,
+    mdot: float = 100.0,
+    H: float = 20000.0,
 ) -> dict:
     """轴对称锥形激波进气道 2D 母线关键点。
 
@@ -47,6 +62,14 @@ def axisymmetric_geometry(
         出口直径（发动机面），单位 m，须 > 0。
     gamma : float
         比热比，默认 1.4。
+    lip_mode : int
+        唇口模式：1 = 尖唇口（sharp），2 = 圆弧唇口（rounded）。默认 1。
+    r_lip : float
+        圆弧唇口半径（m），仅 lip_mode=2 时生效。须 > 0 且 < r_throat。
+    mdot : float
+        设计质量流量（kg/s），用于 ISA 正向推算捕获面积，默认 100.0。
+    H : float
+        飞行高度（m），用于 ISA 正向推算捕获面积，默认 20 000.0。
 
     Returns
     -------
@@ -77,6 +100,16 @@ def axisymmetric_geometry(
         ``'profile_cowl'``
             cowl 内壁母线离散点 ``list of (x, r)``，从唇口到出口，
             x 单调递增，r 单调递增（r_exit > r_cowl，cowl 向外扩张）。
+        ``'lip_mode'``
+            当前唇口模式（1 或 2）。
+        ``'lip_coords'``
+            Mode 1 时为 None；Mode 2 时不存在此键。
+        ``'lip_outer_x'``, ``'lip_outer_y'``
+            Mode 2：外弧（cowl 外表面）离散坐标（在 (x, r) 平面），各 20 点。
+            外弧从 (-r_lip, r_cowl) 到 (0, r_cowl-r_lip)，四分之一圆。
+        ``'lip_inner_x'``, ``'lip_inner_y'``
+            Mode 2：内弧（进气道内侧）离散坐标，各 20 点。
+            内弧从 (0, r_cowl-r_lip) 沿扩压方向延伸，与内壁 C1 连续。
 
     Raises
     ------
@@ -86,28 +119,28 @@ def axisymmetric_geometry(
 
     Notes
     -----
-    **r_capture（质量守恒）**：
+    **r_capture（ISA 大气 + 质量流量正向推算）**：
 
     .. code-block::
 
-        A_capture · φ(M₀) = σ · A_exit · φ(M₂)
-        ⟹ r_capture = sqrt(σ · A_exit · φ(M₂) / (π · φ(M₀)))
+        A_cap = ṁ / (ρ∞ · V∞) = ṁ / (ρ∞ · M₀ · a∞)
+        r_capture = sqrt(A_cap / π)
 
-    **r_cb_base（唇口截面质量守恒）**：
+    **shock-on-lip 几何（r_cb_base）**：
 
-    来流从捕获截面至唇口截面，经锥形激波损失 σ_cone：
+    锥形激波从锥尖出发恰好打在 cowl 唇口，由此确定锥长和锥底半径：
 
     .. code-block::
 
-        A_capture · φ(M₀) = σ_cone · A_lip · φ(M_EX)
-        A_lip = π·(r_cowl² - r_cb_base²)
-        ⟹ r_cb_base = sqrt(r_cowl² - A_lip / π)
+        L_cone    = r_capture / tan(β_c)   （锥尖到唇口的轴向距离）
+        r_cb_base = L_cone · tan(δ_c)      （锥面在唇口截面处的半径）
 
-    **数值示例（M₀=2.0，δ_c=22°，M_EX=1.30，D2=1.37 m）**：
+    **数值示例（M₀=2.0，δ_c=22°，β_c≈39.60°，ṁ=100 kg/s，H=20 km，D2=1.7 m）**：
 
-    - r_cowl ≈ 0.624 m（参考尺度，与 D2 无关），r_cb_base ≈ 0.373 m，r_throat ≈ 0.251 m
-    - r_exit = 0.685 m > r_cowl（cowl 向外扩张约 10%）
-    - x_cone_tip ≈ -0.923 m，x_diffuser_end ≈ 1.164 m
+    - A_cap ≈ 1.924 m²，r_capture = r_cowl ≈ 0.782 m（ISA 物理尺寸）
+    - L_cone ≈ 0.949 m，r_cb_base ≈ 0.383 m，r_throat ≈ 0.399 m
+    - r_exit = 0.850 m > r_cowl（cowl 向外扩张约 9%）
+    - x_cone_tip ≈ -0.949 m，x_diffuser_end ≈ 1.303 m
     """
     if D2 <= 0:
         raise ValueError(f"出口直径 D2 必须 > 0，当前 D2={D2}。")
@@ -115,32 +148,24 @@ def axisymmetric_geometry(
         raise ValueError("stations 缺少必要站位（st0 / stEX / st2）。")
 
     extra = getattr(stations, "extra", None)
-    if extra is None or "delta_c_deg" not in extra or "sigma_cone" not in extra:
+    if extra is None or "delta_c_deg" not in extra or "beta_c_deg" not in extra:
         raise ValueError(
-            "stations.extra 缺少 'delta_c_deg' 或 'sigma_cone'，"
+            "stations.extra 缺少 'delta_c_deg' 或 'beta_c_deg'，"
             "请使用 design_axisymmetric() 生成 stations。"
         )
 
     M0 = stations.st0.M
-    M_EX = stations.stEX.M
-    M2 = stations.st2.M
-    sigma_cone: float = extra["sigma_cone"]
     delta_c_deg: float = extra["delta_c_deg"]
+    beta_c_deg: float = extra["beta_c_deg"]
 
     # ------------------------------------------------------------------
-    # 捕获半径 / cowl 唇口半径（参考尺度 D2_ref=1.0 m，与输入 D2 解耦）
-    # 使 r_cowl 成为由气动设计决定的结构参数，而非随 D2 线性缩放的量。
-    # A_capture_ref · φ(M0) = σ_total · A_exit_ref · φ(M2)，A_exit_ref = π·0.5²
+    # 捕获半径（ISA 大气 + 质量流量正向推算，CLAUDE.md §三 原则 8）
+    # A_cap = ṁ / (ρ∞ · V∞)，r_capture = sqrt(A_cap / π)
+    # 设计工况：ṁ=100 kg/s，M₀=2.0，H=20 000 m → A_cap≈1.924 m²，r_capture≈0.782 m
     # ------------------------------------------------------------------
-    sigma_total = stations.total_pressure_recovery()
-    phi_M0 = mass_flow_function(M0, gamma)
-    phi_M2 = mass_flow_function(M2, gamma)
-
-    r_exit_ref = 0.5                               # D2_ref = 1.0 m
-    A_exit_ref = math.pi * r_exit_ref ** 2
-    A_capture_ref = sigma_total * A_exit_ref * phi_M2 / phi_M0
-    r_cowl = math.sqrt(A_capture_ref / math.pi)    # ≈ 0.624 m，固定不随 D2 变化
-    r_capture = r_cowl
+    A_cap_physical = _isa_capture_area(mdot=mdot, M0=M0, H=H, gamma=gamma)
+    r_capture = math.sqrt(A_cap_physical / math.pi)
+    r_cowl = r_capture    # shock-on-lip 条件下 cowl 唇口半径等于捕获半径
 
     # 实际出口半径（由 D2 决定）
     r_exit = D2 / 2.0
@@ -152,30 +177,32 @@ def axisymmetric_geometry(
         )
 
     # ------------------------------------------------------------------
-    # 中心锥底部半径 r_cb_base（唇口截面质量守恒，基于参考尺度）
-    # A_capture_ref · φ(M0) = σ_cone · A_lip · φ(M_EX)
-    # A_lip = π·(r_cowl² - r_cb_base²)
+    # shock-on-lip 几何：锥尖到唇口的轴向距离
+    # 锥形激波从锥尖出发，恰好打在 cowl 唇口：
+    # L_cone = r_capture / tan(β_c)
     # ------------------------------------------------------------------
-    phi_MEX = mass_flow_function(M_EX, gamma)
-    A_lip = A_capture_ref * phi_M0 / (sigma_cone * phi_MEX)
+    L_cone = r_capture / math.tan(math.radians(beta_c_deg))
 
-    A_cb_base = math.pi * r_cowl ** 2 - A_lip
-    if A_cb_base < 0:
-        raise ValueError(
-            f"几何矛盾：唇口环形面积 A_lip={A_lip:.4f} m² 超过 cowl 总面积 "
-            f"π·r_cowl²={math.pi * r_cowl**2:.4f} m²，导致 r_cb_base 虚数。"
-            f"请检查 stations 参数（M_EX={M_EX}，sigma_cone={sigma_cone:.4f}）。"
-        )
-    r_cb_base = math.sqrt(A_cb_base / math.pi)
+    # ------------------------------------------------------------------
+    # 中心锥底部半径（唇口截面，锥面几何）
+    # 锥面从 (x_cone_tip, 0) 延伸至 (0, r_cb_base)，斜率 tan(δ_c)：
+    # r_cb_base = L_cone * tan(δ_c)
+    # ------------------------------------------------------------------
+    r_cb_base = L_cone * math.tan(math.radians(delta_c_deg))
     r_throat = r_cowl - r_cb_base
+
+    if r_cb_base < 0:
+        raise ValueError(
+            f"几何矛盾：r_cb_base={r_cb_base:.6f} m < 0，请检查锥角参数。"
+        )
 
     # ------------------------------------------------------------------
     # 轴向坐标
     # ------------------------------------------------------------------
     x_cowl = 0.0
 
-    # 锥尖位置：锥面斜率 = tan(delta_c_deg)，锥底在 x=0 处半径为 r_cb_base
-    x_cone_tip = -r_cb_base / math.tan(math.radians(delta_c_deg))
+    # 锥尖位置：锥形激波 shock-on-lip，锥尖在 cowl 唇口上游 L_cone 处
+    x_cone_tip = -L_cone
 
     # 扩压段长度（等效扩张半角 3°）
     # r_exit > r_cowl，cowl 向下游外扩
@@ -205,6 +232,52 @@ def axisymmetric_geometry(
         ri = r_cowl + t * (r_exit - r_cowl)   # 线性外扩（r_exit > r_cowl）
         profile_cowl.append((xi, ri))
 
+    # ------------------------------------------------------------------
+    # 唇口圆弧几何（lip geometry，与 external_2d 同构，坐标 (x, r) 代替 (x, y)）
+    # ------------------------------------------------------------------
+    _N_LIP = 20
+    # 扩压段初始半角（用于内弧切线方向），固定 3°（与 L_diffuser 定义一致）
+    _DIFF_HALF_RAD = math.radians(3.0)
+
+    if lip_mode == 1:
+        lip_extra: dict = {"lip_coords": None}
+    elif lip_mode == 2:
+        if r_lip <= 0.0:
+            raise ValueError(f"lip_mode=2 时 r_lip 须 > 0，当前 r_lip={r_lip}。")
+        if r_lip >= r_throat:
+            raise ValueError(
+                f"r_lip={r_lip:.5f} m 超过环形喉道径向高度 r_throat={r_throat:.5f} m，"
+                "唇口圆弧将与中心锥干涉，请减小 r_lip。"
+            )
+        # 外弧（cowl 外表面）：从 (-r_lip, r_cowl) 到 (0, r_cowl-r_lip)，四分之一圆
+        #   中心 = (-r_lip, r_cowl - r_lip)
+        cx_out = -r_lip
+        cy_out = r_cowl - r_lip
+        _angs_out = np.linspace(np.pi / 2, 0.0, _N_LIP)
+        lip_outer_x = cx_out + r_lip * np.cos(_angs_out)
+        lip_outer_y = cy_out + r_lip * np.sin(_angs_out)
+
+        # 内弧（进气道内侧）：C1 连续，切线从水平过渡到扩压方向（3°）
+        #   起点 = (0, r_cowl - r_lip)，水平切线
+        #   中心 = (0, r_cowl - 2*r_lip)
+        #   顺时针扫过扩压半角（3°）
+        cx_in = 0.0
+        cy_in = r_cowl - 2.0 * r_lip
+        _start_a = np.pi / 2
+        _end_a   = np.pi / 2 - _DIFF_HALF_RAD
+        _angs_in = np.linspace(_start_a, _end_a, _N_LIP)
+        lip_inner_x = cx_in + r_lip * np.cos(_angs_in)
+        lip_inner_y = cy_in + r_lip * np.sin(_angs_in)
+
+        lip_extra = {
+            "lip_outer_x": lip_outer_x,
+            "lip_outer_y": lip_outer_y,
+            "lip_inner_x": lip_inner_x,
+            "lip_inner_y": lip_inner_y,
+        }
+    else:
+        raise ValueError(f"lip_mode 须为 1 或 2，当前 lip_mode={lip_mode}。")
+
     return {
         "r_capture":           r_capture,
         "r_cowl":              r_cowl,
@@ -221,7 +294,66 @@ def axisymmetric_geometry(
             (0.0, r_cb_base),  # 正激波内缘：中心锥底部半径
             (0.0, r_cowl),     # 正激波外缘：cowl 唇口半径
         ),
+        "lip_mode":            lip_mode,
+        **lip_extra,
     }
+
+
+# ---------------------------------------------------------------------------
+# 关键截面提取（用于三维建模验证）
+# ---------------------------------------------------------------------------
+
+def extract_key_sections(geo: dict) -> list[dict]:
+    """从 axisymmetric_geometry 返回值中提取关键截面坐标，用于三维建模和数据验证。
+
+    轴对称构型截面为圆或圆环，用 (x, r_inner, r_outer) 描述。
+
+    Parameters
+    ----------
+    geo : dict
+        ``axisymmetric_geometry()`` 的返回值。
+
+    Returns
+    -------
+    list of dict
+        每个截面包含：
+        ``name``      截面名称（中文）
+        ``x``         截面轴向坐标 (m)
+        ``r_inner``   内径 (m)
+        ``r_outer``   外径 (m)
+        ``note``      备注
+    """
+    sections = [
+        {
+            "name":    "来流捕获面（锥尖截面）",
+            "x":       geo["x_cone_tip"],
+            "r_inner": 0.0,
+            "r_outer": geo["r_capture"],
+            "note":    "锥尖处全圆截面，等效捕获流管",
+        },
+        {
+            "name":    "cowl 唇口 / 喉道",
+            "x":       geo["x_cowl"],               # = 0
+            "r_inner": geo["r_cb_base"],
+            "r_outer": geo["r_cowl"],
+            "note":    f"环形喉道高度 r_throat={geo['r_throat']:.4f} m",
+        },
+        {
+            "name":    "亚声速扩压中点",
+            "x":       geo["x_diffuser_end"] * 0.5,
+            "r_inner": 0.0,
+            "r_outer": (geo["r_cowl"] + geo["r_exit"]) * 0.5,
+            "note":    "扩压段轴向中间截面（cowl 内壁线性扩张）",
+        },
+        {
+            "name":    "出口（发动机面）",
+            "x":       geo["x_diffuser_end"],
+            "r_inner": 0.0,
+            "r_outer": geo["r_exit"],
+            "note":    "D2 = 2 * r_exit",
+        },
+    ]
+    return sections
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +368,11 @@ if __name__ == "__main__":
     from inlets.axisymmetric.aero_design import design_axisymmetric
     st = design_axisymmetric(M0=2.0, delta_c_deg=22.0, M_EX=1.30)
 
-    # 计算参考尺度 r_cowl（D2_ref=1.0），确定保证 cowl 外扩的最小 D2
-    _sigma = st.total_pressure_recovery()
-    _phi_M0 = mass_flow_function(st.st0.M)
-    _phi_M2 = mass_flow_function(st.st2.M)
-    r_cowl = math.sqrt(_sigma * 0.25 * _phi_M2 / _phi_M0)   # ≈ 0.624 m
-    D2 = round(2 * r_cowl * 1.1, 2)                          # cowl 扩张约 10%
+    # 由 ISA 大气 + 质量流量正向推算物理 r_cowl，确定保证 cowl 外扩的最小 D2
+    # 设计工况：ṁ=100 kg/s，M₀=2.0，H=20 km → r_cowl ≈ 0.782 m
+    _A_cap = _isa_capture_area(mdot=100.0, M0=2.0, H=20000.0)
+    r_cowl_ref = math.sqrt(_A_cap / math.pi)   # ≈ 0.782 m
+    D2 = round(2 * r_cowl_ref * 1.1, 2)        # cowl 扩张约 10%
     geo = axisymmetric_geometry(st, D2=D2)
 
     print("=== 轴对称进气道母线关键点 ===")
@@ -271,7 +402,7 @@ if __name__ == "__main__":
     ax.legend(loc='upper right')
     ax.set_xlabel('x (m)')
     ax.set_ylabel('r (m)')
-    ax.set_title(rf'轴对称锥形激波进气道型线($M_0=2.0, \delta_c=22^\circ, M_{{EX}}=1.30, D_2={D2}$ m)')    
+    ax.set_title(rf'轴对称锥形激波进气道型线($M_0=2.0, \delta_c=22^\circ, M_{{EX}}=1.30, \dot{{m}}=100$ kg/s, $D_2={D2}$ m)')    
     ax.grid(True, alpha=0.4)
     plt.tight_layout()
     plt.show()

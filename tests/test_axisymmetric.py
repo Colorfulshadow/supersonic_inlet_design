@@ -196,7 +196,7 @@ class TestAutoOptimization:
 # 7. 几何测试（axisymmetric_geometry）
 # ------------------------------------------------------------------
 
-GEO_D2 = 1.37  # 测试用出口直径（m）；须 >= 2*r_cowl ≈ 1.249m，此处取 1.37m（约 10% 扩张量）
+GEO_D2 = 1.7  # 测试用出口直径（m）；须 >= 2*r_cowl ≈ 1.565m（ISA+ṁ 物理尺寸），此处取 1.7m（约 9% 扩张量）
 
 
 @pytest.fixture(scope="module")
@@ -210,8 +210,8 @@ class TestGeometryBasicShape:
         """
         出口半径大于 cowl 唇口半径（r_exit > r_cowl），cowl 向外扩张。
 
-        r_cowl 以 D2_ref=1.0m 为参考尺度（≈0.624m），与输入 D2 无关；
-        GEO_D2=1.37m 使 r_exit=0.685m > r_cowl≈0.624m（约 10% 扩张量）。
+        r_cowl 由 ISA 大气 + 质量流量正向推算（ṁ=100 kg/s，M₀=2.0，H=20 km）≈0.782m；
+        GEO_D2=1.7m 使 r_exit=0.85m > r_cowl≈0.782m（约 9% 扩张量）。
         """
         assert geo_design["r_exit"] > geo_design["r_cowl"]
 
@@ -286,8 +286,8 @@ class TestGeometryProfiles:
         """
         cowl 内壁母线 r 坐标单调递增（r_exit > r_cowl，cowl 向外扩张）。
 
-        r_cowl ≈ 0.624m（参考尺度），r_exit = GEO_D2/2 = 0.685m；
-        cowl 从唇口向出口线性外扩约 10%，满足亚声速扩压正确方向。
+        r_cowl ≈ 0.782m（ISA 物理尺寸），r_exit = GEO_D2/2 = 0.85m；
+        cowl 从唇口向出口线性外扩约 9%，满足亚声速扩压正确方向。
         """
         rs = [p[1] for p in geo_design["profile_cowl"]]
         assert all(rs[i] <= rs[i + 1] for i in range(len(rs) - 1))
@@ -315,6 +315,70 @@ class TestGeometryErrorHandling:
             axisymmetric_geometry(stations_design, D2=0.0)
 
     def test_D2_too_small_raises(self, stations_design):
-        """D2=1.0m 使 r_exit=0.5m < r_cowl≈0.624m，应抛出 ValueError。"""
+        """D2=1.0m 使 r_exit=0.5m < r_cowl≈0.782m（ISA 物理尺寸），应抛出 ValueError。"""
         with pytest.raises(ValueError, match="cowl 将向内收缩"):
             axisymmetric_geometry(stations_design, D2=1.0)
+
+
+# ------------------------------------------------------------------
+# 8. 唇口圆弧几何（lip geometry，步骤 ⑫）
+# ------------------------------------------------------------------
+
+class TestLipGeometry:
+    """axisymmetric cowl 唇口圆弧几何（lip_mode=1/2）验证。"""
+
+    # --- Mode 1（尖唇口，默认）---
+
+    def test_lip_mode1_lip_coords_none(self, stations_design):
+        """Mode 1：返回 'lip_coords' = None。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=1)
+        assert "lip_coords" in geo
+        assert geo["lip_coords"] is None
+
+    def test_lip_mode1_regression(self, stations_design):
+        """Mode 1 与默认调用（无 lip_mode 参数）r_cowl 一致（回归）。"""
+        geo_default = axisymmetric_geometry(stations_design, D2=GEO_D2)
+        geo_mode1   = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=1)
+        assert geo_default["r_cowl"] == pytest.approx(geo_mode1["r_cowl"])
+
+    def test_lip_mode1_lip_mode_key(self, stations_design):
+        """lip_mode 键值为 1。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=1)
+        assert geo["lip_mode"] == 1
+
+    # --- Mode 2（圆弧唇口）---
+
+    def test_lip_mode2_keys_present(self, stations_design):
+        """Mode 2 返回四个唇口坐标数组键。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=0.005)
+        for key in ("lip_outer_x", "lip_outer_y", "lip_inner_x", "lip_inner_y"):
+            assert key in geo, f"缺少键 '{key}'"
+
+    def test_lip_mode2_inner_x0_continuity(self, stations_design):
+        """lip_inner_x[0] 等于 x_cowl=0（C0 连续）。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=0.005)
+        assert geo["lip_inner_x"][0] == pytest.approx(0.0, abs=1e-9)
+
+    def test_lip_mode2_outer_inner_junction(self, stations_design):
+        """外弧终点与内弧起点坐标重合（C0 连续）。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=0.005)
+        assert geo["lip_outer_x"][-1] == pytest.approx(geo["lip_inner_x"][0], abs=1e-9)
+        assert geo["lip_outer_y"][-1] == pytest.approx(geo["lip_inner_y"][0], abs=1e-9)
+
+    def test_lip_mode2_20_points_each(self, stations_design):
+        """外弧和内弧各 20 个离散点。"""
+        geo = axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=0.005)
+        assert len(geo["lip_outer_x"]) == 20
+        assert len(geo["lip_inner_x"]) == 20
+
+    def test_lip_mode2_r_lip_too_large_raises(self, stations_design):
+        """r_lip ≥ r_throat 时抛出 ValueError。"""
+        geo_ref = axisymmetric_geometry(stations_design, D2=GEO_D2)
+        r_throat = geo_ref["r_throat"]
+        with pytest.raises(ValueError):
+            axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=r_throat + 0.01)
+
+    def test_lip_mode2_r_lip_zero_raises(self, stations_design):
+        """r_lip=0 时 lip_mode=2 抛出 ValueError。"""
+        with pytest.raises(ValueError):
+            axisymmetric_geometry(stations_design, D2=GEO_D2, lip_mode=2, r_lip=0.0)

@@ -1,20 +1,26 @@
 """
 inlets/external_2d/aero_design.py
 ==================================
-二元外压式进气道气动设计：N 级斜激波（Oswatitsch 等强度准则）+ 终端正激波。
+二元外压式进气道气动设计：双模式实现。
 
-Oswatitsch 准则
----------------
+Mode 1（Oswatitsch 等强度准则）
+--------------------------------
 各级斜激波法向马赫数相等（M_n1 = M_n2 = … = M_nN），在给定来流 M0、
 终端激波前马赫数 M_EX 和级数 N 的前提下使总压恢复最大化。
 
-求解策略
---------
-对给定 M_EX，用 brentq 搜索公共法向马赫数 M_n∈(1, M_EX)，使 N 级等强度
-斜激波从 M0 出发恰好到达 M_EX。
+Mode 2（用户自定义楔角，正向计算）
+------------------------------------
+用户直接指定各级楔角列表；工具正向遍历波系，计算 M_EX 和总压恢复。
+用于雷达隐身、结构约束等工程权衡场景的性能折损评估。
 
-若 M_EX 未指定（自动模式），则用全 Oswatitsch 准则：N 级斜激波 + 终端正激波
-全部强度相等，即固定点条件 simulate(M_n) = M_n，同样用 brentq 求解。
+公开接口
+--------
+- ``design_external_2d(M0, N_stages, M_EX, gamma, mode, wedge_angles)``
+  统一入口，mode=1（默认）走 Oswatitsch，mode=2 走用户自定义。
+- ``design_external_2d_mode2(M0, wedge_angles_deg, gamma)``
+  Mode 2 专用接口，正向计算楔角链。
+- ``oswatitsch_angles(M0, N_stages, M_EX, gamma)``
+  Mode 1 辅助：返回最优楔角序列。
 
 单位约定
 --------
@@ -36,11 +42,13 @@ from core.atmosphere import ISAAtmosphere
 from core.compressible_flow import (
     M2_after_normal_shock,
     M2_after_oblique_shock,
+    beta_from_theta_M,
     max_turning_angle,
     shock_pt_ratio,
     theta_from_beta_M,
 )
 from core.flow_stations import FlowState, InletFlowStations
+from core.prandtl_meyer import M_from_pm_angle, prandtl_meyer_angle
 
 
 # ---------------------------------------------------------------------------
@@ -187,54 +195,91 @@ def design_external_2d(
     gamma: float = 1.4,
     h_km: Optional[float] = None,
     m_dot: Optional[float] = None,
+    mode: int = 1,
+    wedge_angles: Optional[List[float]] = None,
+    theta_iso_deg: float = 0.0,
 ) -> InletFlowStations:
-    """二元外压式进气道气动设计（Oswatitsch 最优准则）。
+    """二元外压式进气道气动设计，统一入口。
 
     Parameters
     ----------
     M0 : float
         来流马赫数（站位 0），须 > 1.0。
     N_stages : int
-        外部斜激波级数，默认 3。
+        外部斜激波级数，默认 3（仅 Mode 1 使用）。
     M_EX : float, optional
-        终端正激波前马赫数（站位 EX）。
+        终端正激波前马赫数（站位 EX，仅 Mode 1 使用）。
 
         - 若给定：由 Oswatitsch 准则为该 M_EX 求各级楔角；
-        - 若为 ``None``：全 Oswatitsch 优化——N 级斜激波与终端正激波强度
-          全部相等，通过固定点条件 ``simulate(M_n) = M_n`` 自动求解最优 M_EX。
+        - 若为 ``None``：全 Oswatitsch 优化，通过固定点条件自动求解。
     gamma : float
         比热比，默认 1.4。
     h_km : float, optional
-        飞行高度，单位：千米（km）。若同时提供 ``m_dot``，则附加真实物理量。
+        飞行高度（km）。若同时提供 ``m_dot``，则附加真实物理量。
     m_dot : float, optional
-        质量流量，单位：kg/s。仅在同时提供 ``h_km`` 时生效。
+        质量流量（kg/s）。仅在同时提供 ``h_km`` 时生效。
+    mode : int
+        设计模式：
+
+        - ``1``（默认）—— Oswatitsch 等强度最优准则。
+        - ``2`` —— 用户自定义楔角，须同时传入 ``wedge_angles``。
+    wedge_angles : list of float, optional
+        Mode 2 专用：各级楔角（度）列表，如 ``[8.0, 9.0, 9.5]``。
+    theta_iso_deg : float, optional
+        等熵压缩段额外偏转角（度），默认 0.0（无等熵段）。
+        须满足 ``theta_iso_deg < ν(M_EX)``（M_EX 时的 Prandtl-Meyer 角）。
+        > 0 时在斜激波链之后插入 Prandtl-Meyer 等熵压缩，终端正激波在
+        更低马赫数 M_ISO 前施加，总压恢复提高。
 
     Returns
     -------
     InletFlowStations
         填充以下站位：
 
-        - **st0**  — 来流，M=M0，p_t=1.0（归一化），T_t=1.0
-        - **stEX** — N 级斜激波后，p_t = 各级 shock_pt_ratio 之积
-        - **stNS** — 终端正激波后
-        - **st1**  — 与 stNS 相同（无唇口损失）
-        - **st2**  — 与 st1 相同（扩压段损失 sigma_diff=1.0）
+        - **st0**   — 来流，M=M0，p_t=1.0（归一化），T_t=1.0
+        - **stEX**  — N 级斜激波后
+        - **stISO** — 等熵段出口（仅 theta_iso_deg > 0 时存在）
+        - **stNS**  — 终端正激波后
+        - **st1**   — 与 stNS 相同（无唇口损失）
+        - **st2**   — 与 st1 相同（扩压段损失 sigma_diff=1.0）
 
-        同时在返回对象上附加动态属性 ``wedge_angles``（楔角列表，度）。
+        动态属性 ``wedge_angles``（楔角列表，度）。
 
     Raises
     ------
     ValueError
-        若 M0 ≤ 1.0 或 N_stages < 1。
+        - Mode 1：M0 ≤ 1.0 或 N_stages < 1。
+        - Mode 2：M0 ≤ 1.0，或 ``wedge_angles`` 为 None/空，
+          或某级楔角超过当前马赫数的最大偏转角。
 
     Notes
     -----
-    验证基准（M0=2.0，N=3，M_EX=1.40，γ=1.4）：
+    验证基准（M0=2.0，N=3，M_EX=1.40，Mode 1，γ=1.4）：
 
     - ``stEX.M`` = 1.40 ± 0.01
     - ``total_pressure_recovery()`` ≥ 0.930
-    - ``sum(wedge_angles)`` ≈ 17.22° （Slater 2023 "theta_stg1"=17.34°±0.5°）
+    - ``sum(wedge_angles)`` ≈ 17.22°（Slater 2023 "theta_stg1"=17.34°±0.5°）
     """
+    # ------------------------------------------------------------------
+    # Mode 2：直接委托给专用函数
+    # ------------------------------------------------------------------
+    if mode == 2:
+        if wedge_angles is None or len(wedge_angles) == 0:
+            raise ValueError(
+                "mode=2 时必须通过 wedge_angles 参数传入楔角列表（非空）。"
+            )
+        return design_external_2d_mode2(
+            M0=M0,
+            wedge_angles_deg=wedge_angles,
+            gamma=gamma,
+            h_km=h_km,
+            m_dot=m_dot,
+            theta_iso_deg=theta_iso_deg,
+        )
+
+    # ------------------------------------------------------------------
+    # Mode 1：Oswatitsch 等强度准则（原有逻辑）
+    # ------------------------------------------------------------------
     if M0 <= 1.0:
         raise ValueError(f"来流马赫数 M0 须 > 1.0，当前 M0={M0}。")
     if N_stages < 1:
@@ -266,21 +311,41 @@ def design_external_2d(
     M_final, thetas, pt_EX = _oblique_chain(M0, N_stages, M_n_opt, gamma)
 
     # ------------------------------------------------------------------
-    # 3. 终端正激波
+    # 3. 可选等熵压缩段（Prandtl-Meyer）
     # ------------------------------------------------------------------
-    pt_NS = pt_EX * shock_pt_ratio(M_EX, gamma)
-    M_NS = M2_after_normal_shock(M_EX, gamma)
+    stISO: Optional[FlowState] = None
+    M_before_NS = float(M_EX)   # 终端正激波前马赫数（默认=M_EX）
+
+    if theta_iso_deg > 0.0:
+        nu_EX = prandtl_meyer_angle(M_EX, gamma)
+        if math.degrees(nu_EX) <= theta_iso_deg:
+            raise ValueError(
+                f"theta_iso_deg={theta_iso_deg:.4f}° 须 < ν(M_EX={M_EX:.4f})="
+                f"{math.degrees(nu_EX):.4f}°（Prandtl-Meyer 角上限）。"
+            )
+        nu_ISO = nu_EX - math.radians(theta_iso_deg)
+        M_ISO  = M_from_pm_angle(nu_ISO, gamma)
+        stISO  = FlowState(M=M_ISO, p_t=pt_EX, T_t=1.0, label="ISO")
+        M_before_NS = M_ISO
 
     # ------------------------------------------------------------------
-    # 4. 组装流场站位
+    # 4. 终端正激波
     # ------------------------------------------------------------------
-    st0  = FlowState(M=M0,    p_t=1.0,   T_t=1.0, label="0")
-    stEX = FlowState(M=M_EX,  p_t=pt_EX, T_t=1.0, label="EX")
-    stNS = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="NS")
-    st1  = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="1")
-    st2  = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="2")
+    pt_NS = pt_EX * shock_pt_ratio(M_before_NS, gamma)
+    M_NS  = M2_after_normal_shock(M_before_NS, gamma)
 
-    stations = InletFlowStations(st0=st0, stEX=stEX, stNS=stNS, st1=st1, st2=st2)
+    # ------------------------------------------------------------------
+    # 5. 组装流场站位
+    # ------------------------------------------------------------------
+    st0  = FlowState(M=M0,          p_t=1.0,   T_t=1.0, label="0")
+    stEX = FlowState(M=M_EX,        p_t=pt_EX, T_t=1.0, label="EX")
+    stNS = FlowState(M=M_NS,        p_t=pt_NS, T_t=1.0, label="NS")
+    st1  = FlowState(M=M_NS,        p_t=pt_NS, T_t=1.0, label="1")
+    st2  = FlowState(M=M_NS,        p_t=pt_NS, T_t=1.0, label="2")
+
+    stations = InletFlowStations(
+        st0=st0, stEX=stEX, stISO=stISO, stNS=stNS, st1=st1, st2=st2
+    )
     stations.wedge_angles = thetas  # 动态属性，方便外部访问
 
     # ------------------------------------------------------------------
@@ -310,3 +375,162 @@ def _scan_upper_bound_fp(
     raise ValueError(
         f"无法找到全 Oswatitsch 固定点搜索上界：M0={M0}, N={N}。"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mode 2：用户自定义楔角，正向计算
+# ---------------------------------------------------------------------------
+
+def design_external_2d_mode2(
+    M0: float,
+    wedge_angles_deg: List[float],
+    gamma: float = 1.4,
+    h_km: Optional[float] = None,
+    m_dot: Optional[float] = None,
+    theta_iso_deg: float = 0.0,
+) -> InletFlowStations:
+    """Mode 2：用户指定楔角列表，正向计算波系和总压恢复。
+
+    对每级楔角 θᵢ，求解弱斜激波角 βᵢ（``beta_from_theta_M``），推进流场马赫数
+    并累乘总压比，最后施加终端正激波。
+
+    Parameters
+    ----------
+    M0 : float
+        来流马赫数，须 > 1.0。
+    wedge_angles_deg : list of float
+        各级楔角（度）列表，长度 ≥ 1。第 i 个元素为第 i 级斜面半角。
+    gamma : float
+        比热比，默认 1.4。
+    h_km : float, optional
+        飞行高度（km）。若同时提供 ``m_dot``，则附加真实物理量。
+    m_dot : float, optional
+        质量流量（kg/s）。仅在同时提供 ``h_km`` 时生效。
+
+    Returns
+    -------
+    InletFlowStations
+        填充站位：st0、stEX、stNS、st1、st2。
+
+        动态属性：
+
+        - ``wedge_angles`` — 输入楔角列表的副本（度）
+        - ``extra`` — dict，包含以下键：
+
+          - ``sigma``                  总压恢复系数
+          - ``M_EX``                   终端正激波前马赫数
+          - ``beta_list``              各级激波角（度）
+          - ``M_after_list``           各级斜激波后马赫数
+          - ``theta_list``             原样返回楔角列表（度）
+          - ``sigma_oblique_stages``   各级斜激波总压比
+
+    Raises
+    ------
+    ValueError
+        - M0 ≤ 1.0
+        - ``wedge_angles_deg`` 为空
+        - 某级楔角 θᵢ ≥ 当前马赫数 Mᵢ 时的最大偏转角（提示最大允许值）
+        - 某级激波后马赫数降至 ≤ 1.0
+
+    Notes
+    -----
+    Mode 2 **不保证** Oswatitsch 最优。设计意图是评估给定楔角约束下的性能折损。
+
+    **自洽性验证基准（CLAUDE.md §5.1 Mode 2）**：
+
+    - 输入 ``wedge_angles_deg = oswatitsch_angles(M0=2.0, N=3, M_EX=1.40)`` 时，
+      Mode 2 输出 σ 与 Mode 1 偏差 < 0.001。
+    - N=3 等强度条件：各级 ``sigma_oblique_stages`` 相等（偏差 < 0.001）。
+    """
+    if M0 <= 1.0:
+        raise ValueError(f"来流马赫数 M0 须 > 1.0，当前 M0={M0}。")
+    if not wedge_angles_deg:
+        raise ValueError("楔角列表 wedge_angles_deg 不能为空。")
+
+    M_curr = float(M0)
+    pt_EX = 1.0
+    beta_list:             List[float] = []
+    M_after_list:          List[float] = []
+    sigma_oblique_stages:  List[float] = []
+
+    for stage_idx, theta_deg in enumerate(wedge_angles_deg, start=1):
+        # ---- 最大偏转角检查（比 beta_from_theta_M 内部错误更友好）----
+        theta_max = max_turning_angle(M_curr, gamma)
+        if theta_deg >= theta_max:
+            raise ValueError(
+                f"第 {stage_idx} 级楔角 {theta_deg:.4f}° 超过当前马赫数 "
+                f"M={M_curr:.4f} 时的最大偏转角 {theta_max:.4f}°。"
+                f"请将第 {stage_idx} 级楔角减小至 < {theta_max:.2f}°。"
+            )
+
+        # ---- 激波角（弱激波，返回度） ----
+        beta_deg = beta_from_theta_M(theta_deg, M_curr, gamma)
+        beta_rad = math.radians(beta_deg)
+        theta_rad = math.radians(theta_deg)
+
+        # ---- 法向马赫数 → 总压比 ----
+        M_n = M_curr * math.sin(beta_rad)
+        sigma_i = shock_pt_ratio(M_n, gamma)
+        pt_EX *= sigma_i
+
+        # ---- 激波后马赫数 ----
+        M_curr = M2_after_oblique_shock(M_curr, beta_rad, theta_rad, gamma)
+        if M_curr <= 1.0:
+            raise ValueError(
+                f"第 {stage_idx} 级斜激波后马赫数 {M_curr:.4f} ≤ 1.0，"
+                "流场进入亚声速，楔角序列不合法（请减小楔角或减少级数）。"
+            )
+
+        beta_list.append(beta_deg)
+        M_after_list.append(float(M_curr))
+        sigma_oblique_stages.append(float(sigma_i))
+
+    # ---- 等熵压缩段（Prandtl-Meyer，可选）----
+    M_EX = float(M_curr)
+    stISO: Optional[FlowState] = None
+    M_before_NS = M_EX   # 终端正激波前马赫数
+
+    if theta_iso_deg > 0.0:
+        nu_EX = prandtl_meyer_angle(M_EX, gamma)
+        if math.degrees(nu_EX) <= theta_iso_deg:
+            raise ValueError(
+                f"theta_iso_deg={theta_iso_deg:.4f}° 须 < ν(M_EX={M_EX:.4f})="
+                f"{math.degrees(nu_EX):.4f}°（Prandtl-Meyer 角上限）。"
+            )
+        nu_ISO = nu_EX - math.radians(theta_iso_deg)
+        M_ISO  = M_from_pm_angle(nu_ISO, gamma)
+        stISO  = FlowState(M=M_ISO, p_t=pt_EX, T_t=1.0, label="ISO")
+        M_before_NS = M_ISO
+
+    # ---- 终端正激波 ----
+    pt_NS = pt_EX * shock_pt_ratio(M_before_NS, gamma)
+    M_NS  = M2_after_normal_shock(M_before_NS, gamma)
+
+    # ---- 组装流场站位 ----
+    st0  = FlowState(M=M0,    p_t=1.0,   T_t=1.0, label="0")
+    stEX = FlowState(M=M_EX,  p_t=pt_EX, T_t=1.0, label="EX")
+    stNS = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="NS")
+    st1  = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="1")
+    st2  = FlowState(M=M_NS,  p_t=pt_NS, T_t=1.0, label="2")
+
+    stations = InletFlowStations(
+        st0=st0, stEX=stEX, stISO=stISO, stNS=stNS, st1=st1, st2=st2
+    )
+    stations.wedge_angles = list(wedge_angles_deg)   # type: ignore[attr-defined]
+
+    # ---- 附加详细波系信息 ----
+    stations.extra = {                               # type: ignore[attr-defined]
+        "sigma":                 stations.total_pressure_recovery(),
+        "M_EX":                  M_EX,
+        "beta_list":             beta_list,
+        "M_after_list":          M_after_list,
+        "theta_list":            list(wedge_angles_deg),
+        "sigma_oblique_stages":  sigma_oblique_stages,
+    }
+
+    # ---- 可选：附加真实物理量 ----
+    if h_km is not None and m_dot is not None:
+        atm = ISAAtmosphere(h_km * 1000.0, gamma)
+        stations.attach_physical_conditions(atm, M0, m_dot)
+
+    return stations

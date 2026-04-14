@@ -82,24 +82,26 @@ class InletFlowStations:
 
     Attributes
     ----------
-    st0  : FlowState | None  自由来流
-    stL  : FlowState | None  进气道前缘局部来流
-    stEX : FlowState | None  外部超声速扩压末端（NS 上游）
-    stNS : FlowState | None  终端正激波下游
-    st1  : FlowState | None  唇口入口截面
-    stTH : FlowState | None  喉道
-    stSD : FlowState | None  亚声速扩压起点
-    st2  : FlowState | None  发动机面（进气道出口）
+    st0   : FlowState | None  自由来流
+    stL   : FlowState | None  进气道前缘局部来流
+    stEX  : FlowState | None  外部超声速扩压末端（等熵段/NS 上游）
+    stISO : FlowState | None  等熵压缩段出口（Prandtl-Meyer，终端正激波上游；无等熵段时为 None）
+    stNS  : FlowState | None  终端正激波下游
+    st1   : FlowState | None  唇口入口截面
+    stTH  : FlowState | None  喉道
+    stSD  : FlowState | None  亚声速扩压起点
+    st2   : FlowState | None  发动机面（进气道出口）
     """
 
-    st0:  Optional[FlowState] = None
-    stL:  Optional[FlowState] = None
-    stEX: Optional[FlowState] = None
-    stNS: Optional[FlowState] = None
-    st1:  Optional[FlowState] = None
-    stTH: Optional[FlowState] = None
-    stSD: Optional[FlowState] = None
-    st2:  Optional[FlowState] = None
+    st0:   Optional[FlowState] = None
+    stL:   Optional[FlowState] = None
+    stEX:  Optional[FlowState] = None
+    stISO: Optional[FlowState] = None
+    stNS:  Optional[FlowState] = None
+    st1:   Optional[FlowState] = None
+    stTH:  Optional[FlowState] = None
+    stSD:  Optional[FlowState] = None
+    st2:   Optional[FlowState] = None
 
     # ------------------------------------------------------------------
     # 总压恢复
@@ -161,14 +163,15 @@ class InletFlowStations:
             ``<标签>  M=<M>  p_t=<p_t>  T_t=<T_t>``
         """
         _station_order = [
-            ("0",  self.st0),
-            ("L",  self.stL),
-            ("EX", self.stEX),
-            ("NS", self.stNS),
-            ("1",  self.st1),
-            ("TH", self.stTH),
-            ("SD", self.stSD),
-            ("2",  self.st2),
+            ("0",   self.st0),
+            ("L",   self.stL),
+            ("EX",  self.stEX),
+            ("ISO", self.stISO),
+            ("NS",  self.stNS),
+            ("1",   self.st1),
+            ("TH",  self.stTH),
+            ("SD",  self.stSD),
+            ("2",   self.st2),
         ]
         lines = ["进气道 8 站位流场摘要", "-" * 52]
         for tag, st in _station_order:
@@ -263,7 +266,7 @@ class InletFlowStations:
 
         # ---- 更新所有非 None 站位的绝对总温总压 ----
         _all_stations = [
-            "st0", "stL", "stEX", "stNS", "st1", "stTH", "stSD", "st2",
+            "st0", "stL", "stEX", "stISO", "stNS", "st1", "stTH", "stSD", "st2",
         ]
         for attr in _all_stations:
             st: Optional[FlowState] = getattr(self, attr)

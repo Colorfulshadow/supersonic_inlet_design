@@ -30,8 +30,11 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Tuple
 
+import numpy as np
+
 from core.compressible_flow import beta_from_theta_M
 from core.flow_stations import InletFlowStations
+from core.prandtl_meyer import isentropic_ramp_coords
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,10 @@ def external_2d_geometry(
     gamma: float = 1.4,
     N_throat: float = 2.0,
     L_diff_extra: float = 2.0,
+    theta_iso_deg: float = 0.0,
+    L_iso: Optional[float] = None,
+    lip_mode: int = 1,
+    r_lip: float = 0.0,
 ) -> dict:
     """二元外压式进气道型线关键点计算。
 
@@ -71,6 +78,10 @@ def external_2d_geometry(
         喉道出口到发动机面的附加扩压长度（m，默认 2.0）。
     gamma : float
         比热比，默认 1.4。
+    lip_mode : int
+        唇口模式：1 = 尖唇口（sharp），2 = 圆弧唇口（rounded）。默认 1。
+    r_lip : float
+        圆弧唇口半径（m），仅 lip_mode=2 时生效。须 > 0 且 < 喉道高度。
 
     Returns
     -------
@@ -93,6 +104,16 @@ def external_2d_geometry(
             上壁（cowl 外壁）离散点序列 list of (x, y)，x 单调递增。
         ``'profile_lower'``
             下壁（ramp）离散点序列 list of (x, y)，x 单调递增。
+        ``'lip_mode'``
+            当前唇口模式（1 或 2）。
+        ``'lip_coords'``
+            Mode 1 时为 None；Mode 2 时不存在此键。
+        ``'lip_outer_x'``, ``'lip_outer_y'``
+            Mode 2：外弧（cowl 外表面）离散坐标，各 20 点。
+            外弧从 (-r_lip, y_cowl) 到 (0, y_cowl-r_lip)，四分之一圆。
+        ``'lip_inner_x'``, ``'lip_inner_y'``
+            Mode 2：内弧（进气道内侧）离散坐标，各 20 点。
+            内弧从 (0, y_cowl-r_lip) 沿 cowl_angle 方向延伸，与内壁 C1 连续。
 
     Notes
     -----
@@ -291,12 +312,50 @@ def external_2d_geometry(
         shock_points.append(((x_start, y_start), (x_end, y_end)))
 
     # ------------------------------------------------------------------
+    # 3b. 等熵压缩 ramp（Prandtl-Meyer，可选）
+    # ------------------------------------------------------------------
+    # 起始点为 ramp_points[-1]（坐标原点附近，x=0，y=ramp_y[-1]）
+    # ramp 倾角 = sum(wedge_angles)（斜激波累积偏转）
+    if theta_iso_deg > 0.0:
+        if stations.stEX is None:
+            raise ValueError("stations.stEX 为 None，无法计算等熵段。")
+        M_iso_start   = stations.stEX.M
+        theta_ramp_0  = sum(wedge_angles)   # 斜激波链末尾 ramp 倾角（度）
+
+        # 物理弧长：默认 = 唇口-ramp 间距的 50%
+        H_throat_entry_approx = y_cowl - ramp_points[-1][1]
+        L_iso_use = L_iso if L_iso is not None else H_throat_entry_approx * 0.5
+
+        n_iso = 50
+        xs_local, ys_local, _M_iso_end, _theta_iso_end = isentropic_ramp_coords(
+            M_iso_start, theta_ramp_0, theta_iso_deg, n_steps=n_iso, gamma=gamma
+        )
+        # 缩放：总弧长 = L_iso_use
+        scale = L_iso_use / float(n_iso)
+        x_start_iso = ramp_points[-1][0]   # = 0
+        y_start_iso = ramp_points[-1][1]
+
+        iso_ramp_x: np.ndarray = xs_local * scale + x_start_iso
+        iso_ramp_y: np.ndarray = ys_local * scale + y_start_iso
+
+        # 等熵段出口作为喉道圆弧起点
+        arc_start_x   = float(iso_ramp_x[-1])
+        arc_start_y   = float(iso_ramp_y[-1])
+        theta_arc_deg = theta_ramp_0 + theta_iso_deg   # 总倾角（度）
+    else:
+        iso_ramp_x  = np.array([], dtype=float)
+        iso_ramp_y  = np.array([], dtype=float)
+        arc_start_x = ramp_points[-1][0]   # = 0
+        arc_start_y = ramp_points[-1][1]
+        theta_arc_deg = sum(wedge_angles)
+
+    # ------------------------------------------------------------------
     # 4. 喉道圆弧过渡（终端正激波后，下壁从斜面角过渡到水平）
     # ------------------------------------------------------------------
-    theta_total = sum(wedge_angles)          # 下壁总偏转角（度）
+    theta_total = theta_arc_deg              # 下壁总偏转角（度），含等熵段
     theta_rad   = math.radians(theta_total)
-    # 进气道入口高度（cowl 唇口到最后一个 ramp 折点的距离）
-    H_throat_entry = y_cowl - ramp_points[-1][1]
+    # 进气道入口高度（cowl 唇口到圆弧起点的距离）
+    H_throat_entry = y_cowl - arc_start_y
 
     # 下壁圆弧半径：N_throat * H_throat_entry
     # （使 N_throat=2.0 时圆弧抬升量足以超过出口下壁高度，形成可见 C-D 喉道）
@@ -304,15 +363,14 @@ def external_2d_geometry(
 
     N_arc = 20
     if R_lower < 1e-9:
-        # N_throat ≈ 1，无过渡弧，直接以折点为喉道
-        x_throat       = 0.0
-        y_throat_lower = ramp_points[-1][1]
-        lower_arc: List[Tuple[float, float]] = [ramp_points[-1]]
+        # N_throat ≈ 1，无过渡弧，直接以圆弧起点为喉道
+        x_throat       = arc_start_x
+        y_throat_lower = arc_start_y
+        lower_arc: List[Tuple[float, float]] = [(arc_start_x, arc_start_y)]
     else:
-        # 圆弧圆心（使弧在 ramp_points[-1] 处与下壁斜面相切，在终点处切线水平）
-        # 圆心相对 ramp_points[-1] 偏移：垂直于切线方向（顺时针 90°），即指向弧内侧
-        cx_low = R_lower * math.sin(theta_rad)
-        cy_low = ramp_points[-1][1] - R_lower * math.cos(theta_rad)
+        # 圆弧圆心（使弧在 arc_start 处与下壁斜面相切，在终点处切线水平）
+        cx_low = arc_start_x + R_lower * math.sin(theta_rad)
+        cy_low = arc_start_y - R_lower * math.cos(theta_rad)
 
         # 弧从起始角 (π/2 + theta_rad) 扫到 π/2（切线从斜面角变为水平）
         start_ang = math.pi / 2 + theta_rad
@@ -324,8 +382,8 @@ def external_2d_geometry(
             lower_arc.append((cx_low + R_lower * math.cos(ang),
                                cy_low + R_lower * math.sin(ang)))
 
-        x_throat       = lower_arc[-1][0]   # = cx_low = R_lower * sin(theta_rad)
-        y_throat_lower = lower_arc[-1][1]   # 下壁在水平切线处的 y 值
+        x_throat       = lower_arc[-1][0]
+        y_throat_lower = lower_arc[-1][1]
 
     # ------------------------------------------------------------------
     # 5. 上壁（cowl）过渡弧：N_arc 点水平段，从 cowl 唇口延伸到喉道截面
@@ -352,23 +410,83 @@ def external_2d_geometry(
         + [(x_exit, y_cowl)]
     )
 
-    # 下壁：ramp 折点序列 → 过渡圆弧（去重首点）→ 扩压出口
-    profile_lower: List[Tuple[float, float]] = (
-        list(ramp_points)
-        + lower_arc[1:]        # lower_arc[0] == ramp_points[-1]，跳过
-        + [(x_exit, y_exit_lower)]
-    )
+    # 下壁：ramp 折点序列 → [等熵段（可选）→] 过渡圆弧 → 扩压出口
+    if theta_iso_deg > 0.0:
+        # 等熵段第一点 = ramp_points[-1]（重合），跳过；lower_arc[0] = iso_ramp[-1]，跳过
+        iso_pts = list(zip(iso_ramp_x.tolist(), iso_ramp_y.tolist()))
+        profile_lower: List[Tuple[float, float]] = (
+            list(ramp_points)
+            + iso_pts[1:]          # 跳过 iso_pts[0]（与 ramp_points[-1] 重合）
+            + lower_arc[1:]        # lower_arc[0] 与 iso_pts[-1] 重合，跳过
+            + [(x_exit, y_exit_lower)]
+        )
+    else:
+        profile_lower = (
+            list(ramp_points)
+            + lower_arc[1:]        # lower_arc[0] == ramp_points[-1]，跳过
+            + [(x_exit, y_exit_lower)]
+        )
 
     # ------------------------------------------------------------------
     # 8. 终端正激波端点（倾斜，与偏折后气流方向垂直）
-    # 从 cowl 唇口出发，气流向右上偏折，因此激波向右下延伸
+    # 从等熵段末尾（或 cowl 唇口基准面）出发，激波向下延伸
     # ------------------------------------------------------------------
-    H_throat_entry = y_cowl - ramp_points[-1][1]
-    x_ns_ramp = H_throat_entry * math.tan(theta_rad)
+    x_ns_start = arc_start_x   # 正激波上端 x = 圆弧起点 x
+    x_ns_ramp  = x_ns_start + H_throat_entry * math.tan(theta_rad)
     normal_shock_points = (
-        (0.0, y_cowl),                      # 上端：cowl 唇口
-        (x_ns_ramp, ramp_points[-1][1]),    # 下端：正激波与下壁交点
+        (x_ns_start, y_cowl),          # 上端：cowl 对应 x 处
+        (x_ns_ramp,  arc_start_y),     # 下端：正激波与下壁交点
     )
+
+    # ------------------------------------------------------------------
+    # 9. 唇口圆弧几何（lip geometry）
+    # ------------------------------------------------------------------
+    # 喉道通道高度（cowl 唇口 y 坐标 - 最后一级折点 y 坐标）
+    H_throat = y_cowl - ramp_points[-1][1]
+    _N_LIP = 20
+
+    if lip_mode == 1:
+        lip_extra: dict = {"lip_coords": None}
+    elif lip_mode == 2:
+        if r_lip <= 0.0:
+            raise ValueError(f"lip_mode=2 时 r_lip 须 > 0，当前 r_lip={r_lip}。")
+        if r_lip >= H_throat:
+            raise ValueError(
+                f"r_lip={r_lip:.5f} m 超过喉道高度 H_throat={H_throat:.5f} m，"
+                "唇口圆弧将与下壁干涉，请减小 r_lip。"
+            )
+        # 外弧（外罩外表面）：四分之一圆
+        #   中心 = (-r_lip, y_cowl - r_lip)
+        #   起点 = (-r_lip, y_cowl)          [与水平外壁相切]
+        #   终点 = (0,       y_cowl - r_lip) [唇口尖端]
+        cx_out = -r_lip
+        cy_out = y_cowl - r_lip
+        _angs_out = np.linspace(np.pi / 2, 0.0, _N_LIP)
+        lip_outer_x = cx_out + r_lip * np.cos(_angs_out)
+        lip_outer_y = cy_out + r_lip * np.sin(_angs_out)
+
+        # 内弧（进气道内侧）：圆弧与 cowl 内壁相切，C1 连续
+        #   起点 = (0, y_cowl - r_lip)       [与外弧终点重合，水平切线]
+        #   中心 = (0, y_cowl - 2*r_lip)
+        #   圆弧沿顺时针扫过 cowl_angle（楔角累积偏转）弧度
+        #   终切线 = (cos(cowl_angle), -sin(cowl_angle)) ≡ 内壁方向
+        cowl_angle_rad = math.radians(sum(wedge_angles))
+        cx_in = 0.0
+        cy_in = y_cowl - 2.0 * r_lip
+        _start_a = np.pi / 2
+        _end_a   = np.pi / 2 - cowl_angle_rad
+        _angs_in = np.linspace(_start_a, _end_a, _N_LIP)
+        lip_inner_x = cx_in + r_lip * np.cos(_angs_in)
+        lip_inner_y = cy_in + r_lip * np.sin(_angs_in)
+
+        lip_extra = {
+            "lip_outer_x": lip_outer_x,
+            "lip_outer_y": lip_outer_y,
+            "lip_inner_x": lip_inner_x,
+            "lip_inner_y": lip_inner_y,
+        }
+    else:
+        raise ValueError(f"lip_mode 须为 1 或 2，当前 lip_mode={lip_mode}。")
 
     return {
         "H_capture":           H_capture,
@@ -376,10 +494,112 @@ def external_2d_geometry(
         "y_cowl":              y_cowl,
         "ramp_points":         ramp_points,
         "shock_points":        shock_points,
+        "iso_ramp_x":          iso_ramp_x,
+        "iso_ramp_y":          iso_ramp_y,
         "profile_upper":       profile_upper,
         "profile_lower":       profile_lower,
         "normal_shock_points": normal_shock_points,
+        "lip_mode":            lip_mode,
+        **lip_extra,
     }
+
+
+# ---------------------------------------------------------------------------
+# 关键截面提取（用于三维建模验证）
+# ---------------------------------------------------------------------------
+
+def extract_key_sections(geo: dict) -> list[dict]:
+    """从 external_2d_geometry 返回值中提取关键截面坐标，用于三维建模和数据验证。
+
+    二元外压式为矩形截面（展向均匀），截面用
+    (x, y_lower, y_upper, height) 描述，展向宽度由捕获面积和 H_capture 确定。
+
+    Parameters
+    ----------
+    geo : dict
+        ``external_2d_geometry()`` 的返回值。
+
+    Returns
+    -------
+    list of dict
+        每个截面包含：
+        ``name``      截面名称（中文）
+        ``x``         截面轴向坐标 (m)
+        ``y_lower``   下壁 y 坐标 (m)
+        ``y_upper``   上壁（cowl）y 坐标 (m)
+        ``height``    截面通道高度 = y_upper - y_lower (m)
+        ``note``      备注
+    """
+    y_cowl = geo["y_cowl"]
+    ramp   = geo["ramp_points"]   # list of (x, y)
+    sections: list[dict] = []
+
+    # 1. 来流捕获面（第一个 ramp 折点处，激波起点）
+    x0, y0 = ramp[0]
+    sections.append({
+        "name":    "来流捕获面",
+        "x":       x0,
+        "y_lower": y0,
+        "y_upper": y_cowl,
+        "height":  y_cowl - y0,
+        "note":    "第 1 级激波起点，H_capture 高度",
+    })
+
+    # 2. 各级 ramp 折点（斜激波起点）
+    for i, (xi, yi) in enumerate(ramp[1:], start=2):
+        sections.append({
+            "name":    f"斜面折点 {i}（第 {i} 级激波起点）",
+            "x":       xi,
+            "y_lower": yi,
+            "y_upper": y_cowl,
+            "height":  y_cowl - yi,
+            "note":    f"第 {i} 级斜激波起始截面",
+        })
+
+    # 3. 等熵压缩段末尾（若存在）
+    iso_x = geo.get("iso_ramp_x")
+    iso_y = geo.get("iso_ramp_y")
+    if iso_x is not None and len(iso_x) > 0:
+        sections.append({
+            "name":    "等熵压缩段末尾",
+            "x":       float(iso_x[-1]),
+            "y_lower": float(iso_y[-1]),
+            "y_upper": y_cowl,
+            "height":  y_cowl - float(iso_y[-1]),
+            "note":    "Prandtl-Meyer 等熵段出口（圆弧过渡起点）",
+        })
+
+    # 4. 喉道（下壁圆弧末端，上壁仍为 y_cowl）
+    profile_lower = geo.get("profile_lower", [])
+    profile_upper = geo.get("profile_upper", [])
+    if profile_lower and profile_upper:
+        # 喉道：上壁水平，下壁圆弧结束处 → 上下壁间距最小的截面
+        # 近似取：正激波端点对应的上游最后一个截面
+        ns = geo.get("normal_shock_points")
+        if ns:
+            x_ns_top = ns[0][0]
+            sections.append({
+                "name":    "终端正激波截面（喉道入口）",
+                "x":       x_ns_top,
+                "y_lower": ns[1][1],    # 正激波下端 y
+                "y_upper": ns[0][1],    # 正激波上端 y（= y_cowl）
+                "height":  ns[0][1] - ns[1][1],
+                "note":    "终端正激波位置，为内部流道最窄处",
+            })
+
+    # 5. 出口（发动机面）— 从 profile_lower 最后一点 + y_cowl
+    if profile_lower:
+        x_exit, y_exit_lower = profile_lower[-1]
+        sections.append({
+            "name":    "出口（发动机面）",
+            "x":       x_exit,
+            "y_lower": y_exit_lower,
+            "y_upper": y_cowl,
+            "height":  y_cowl - y_exit_lower,
+            "note":    "D2 = y_upper - y_lower（矩形截面高度）",
+        })
+
+    return sections
 
 
 # ---------------------------------------------------------------------------
